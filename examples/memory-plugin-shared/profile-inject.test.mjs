@@ -229,3 +229,139 @@ test("isRepeatInjection reports an unchanged block for the same session only", (
   assert.equal(isRepeatInjection(path, "s1", "block B"), false);
   assert.equal(isRepeatInjection(path, "s1", "block B"), true);
 });
+
+
+// "default" is what the catalog tests' server resolves to, and
+// resolveUserSpace memoizes in a module-level cache that outlives one
+// test: a different space here would be poisoned by whichever ran first.
+const SPACE = "default";
+const PEER = "github.com-acme-webapp";
+const PEER_ROOT = `viking://user/${SPACE}/peers/${PEER}/memories`;
+const USER_ROOT = `viking://user/${SPACE}/memories`;
+
+/**
+ * A fetch double over three scopes' worth of fixtures. `read` maps a full URI
+ * to a body; anything unspecified 404s the way the server does, and `ls` maps a
+ * directory URI to entries, [] for a missing one.
+ */
+function makeFetch({ read = {}, ls = {} } = {}) {
+  const calls = [];
+  const fetchJSON = async (path) => {
+    calls.push(path);
+    const uri = decodeURIComponent(new URL(`http://x${path}`).searchParams.get("uri") || "");
+    if (path.startsWith("/api/v1/system/status")) {
+      return { ok: true, status: 200, result: { user: SPACE } };
+    }
+    if (path.startsWith("/api/v1/fs/ls")) {
+      if (uri === "viking://user") {
+        return { ok: true, status: 200, result: [{ name: SPACE, isDir: true }] };
+      }
+      const list = ls[uri] ?? [];
+      return { ok: true, status: 200, result: list };
+    }
+    if (path.startsWith("/api/v1/content/read")) {
+      if (Object.hasOwn(read, uri)) return { ok: true, status: 200, result: read[uri] };
+      return { ok: false, status: 404, error: { code: "NOT_FOUND" } };
+    }
+    return { ok: false, status: 404, error: { code: "NOT_FOUND" } };
+  };
+  return { fetchJSON, calls };
+}
+
+const entry = (relPath) => ({ rel_path: relPath, name: relPath.split("/").pop(), abstract: "", isDir: false });
+
+test("peer scope supplies the profile when both scopes have one", async () => {
+  const { fetchJSON } = makeFetch({
+    read: {
+      [`${PEER_ROOT}/profile.md`]: "# Zeus\nPeer-scoped profile.",
+      [`${USER_ROOT}/profile.md`]: "# Zeus\nUser-scoped profile.",
+    },
+  });
+  const block = await buildProfileBlock(fetchJSON, 2000, PEER);
+  assert.match(block.block, new RegExp(`<user-profile uri="${PEER_ROOT}/profile\\.md">`));
+  assert.match(block.block, /Peer-scoped profile\./);
+  assert.doesNotMatch(block.block, /User-scoped profile\./);
+});
+
+test("listings come from peer scope when the peer has them", async () => {
+  const { fetchJSON } = makeFetch({
+    read: { [`${PEER_ROOT}/profile.md`]: "# Zeus" },
+    ls: {
+      [`${PEER_ROOT}/preferences`]: [entry("zeus/workflow.md")],
+      [`${PEER_ROOT}/entities`]: [entry("software/openviking.md")],
+      [`${USER_ROOT}/preferences`]: [entry("zeus/user-only.md")],
+      [`${USER_ROOT}/entities`]: [entry("software/user-only.md")],
+    },
+  });
+  const res = await buildProfileBlock(fetchJSON, 2000, PEER);
+  assert.equal(res.prefCount, 1);
+  assert.equal(res.entCount, 1);
+  assert.match(res.block, /zeus\/workflow\.md/);
+  assert.doesNotMatch(res.block, /user-only\.md/);
+});
+
+// The case that separates per-category resolution from per-scope: a peer with
+// listings but no profile.md must not take the profile down with it.
+test("a peer with listings but no profile.md falls back to the user profile", async () => {
+  const { fetchJSON } = makeFetch({
+    read: { [`${USER_ROOT}/profile.md`]: "# Zeus\nUser-scoped profile." },
+    ls: {
+      [`${PEER_ROOT}/preferences`]: [entry("zeus/workflow.md")],
+      [`${PEER_ROOT}/entities`]: [entry("software/openviking.md")],
+    },
+  });
+  const res = await buildProfileBlock(fetchJSON, 2000, PEER);
+  assert.match(res.block, new RegExp(`<user-profile uri="${USER_ROOT}/profile\\.md">`));
+  assert.match(res.block, /User-scoped profile\./);
+  assert.match(res.block, /zeus\/workflow\.md/);
+  assert.match(res.block, /software\/openviking\.md/);
+});
+
+test("no peer reads user scope, unchanged from before", async () => {
+  const { fetchJSON, calls } = makeFetch({
+    read: { [`${USER_ROOT}/profile.md`]: "# Zeus\nUser-scoped profile." },
+    ls: { [`${USER_ROOT}/preferences`]: [entry("zeus/workflow.md")] },
+  });
+  const res = await buildProfileBlock(fetchJSON, 2000, "");
+  assert.match(res.block, new RegExp(`<user-profile uri="${USER_ROOT}/profile\\.md">`));
+  assert.equal(res.prefCount, 1);
+  // No request may name a peer scope when there is no peer.
+  assert.ok(calls.every((p) => !p.includes("/peers/")));
+});
+
+test("user scope still wins when the peer is empty and the user has everything", async () => {
+  const { fetchJSON } = makeFetch({
+    read: { [`${USER_ROOT}/profile.md`]: "# Zeus\nUser-scoped profile." },
+    ls: {
+      [`${USER_ROOT}/preferences`]: [entry("zeus/workflow.md")],
+      [`${USER_ROOT}/entities`]: [entry("software/openviking.md")],
+    },
+  });
+  const res = await buildProfileBlock(fetchJSON, 2000, PEER);
+  assert.match(res.block, new RegExp(`<user-profile uri="${USER_ROOT}/profile\\.md">`));
+  assert.equal(res.prefCount, 1);
+  assert.equal(res.entCount, 1);
+});
+
+test("nothing anywhere still returns null", async () => {
+  const { fetchJSON } = makeFetch();
+  assert.equal(await buildProfileBlock(fetchJSON, 2000, PEER), null);
+  assert.equal(await buildProfileBlock(fetchJSON, 2000, ""), null);
+});
+
+test("categories resolve independently within peer scope", async () => {
+  // Peer has only entities; user has only preferences. The block should carry
+  // both, each from its own scope.
+  const { fetchJSON } = makeFetch({
+    read: { [`${PEER_ROOT}/profile.md`]: "# Zeus" },
+    ls: {
+      [`${PEER_ROOT}/entities`]: [entry("software/openviking.md")],
+      [`${USER_ROOT}/preferences`]: [entry("zeus/workflow.md")],
+    },
+  });
+  const res = await buildProfileBlock(fetchJSON, 2000, PEER);
+  assert.equal(res.prefCount, 1);
+  assert.equal(res.entCount, 1);
+  assert.match(res.block, new RegExp(`${USER_ROOT}/preferences/`));
+  assert.match(res.block, new RegExp(`${PEER_ROOT}/entities/`));
+});

@@ -377,19 +377,67 @@ export async function buildProfileBlock(fetchJSON, totalBudgetTokens, actorPeerI
     : Infinity;
   const skillBudget = Math.min(skillCatalogTokenBudget, Math.floor(capTokens / 4));
   const space = await resolveUserSpace(fetchJSON, actorPeerId);
-  const profileUri = `viking://user/${space}/memories/profile.md`;
-  const prefUri = `viking://user/${space}/memories/preferences`;
-  const entUri = `viking://user/${space}/memories/entities`;
 
-  const [profile, prefs, ents, skillGroups] = await Promise.all([
-    readProfile(fetchJSON, profileUri, actorPeerId),
-    lsDir(fetchJSON, prefUri, actorPeerId),
-    lsDir(fetchJSON, entUri, actorPeerId),
-    skillCatalog && skillBudget > 0
-      ? fetchSkillCatalog(fetchJSON, actorPeerId)
-      : [],
-  ]);
-  const skills = formatSkillCatalog(skillGroups, skillBudget);
+  // The skill catalog is account-wide, so it is read alongside the peer's own
+  // scope rather than one scope at a time.
+  const skillGroupsPromise = skillCatalog && skillBudget > 0
+    ? fetchSkillCatalog(fetchJSON, actorPeerId)
+    : [];
+
+  // Each category is resolved on its own, peer scope first. A workspace peer
+  // keeps one project's memories under
+  // viking://user/<space>/peers/<peer>/memories, which is where capture writes,
+  // so it is the scope that normally wins. User scope stays as the fallback for
+  // non-repository workspaces and for memories written before peer scoping
+  // became the default.
+  //
+  // Per category rather than per scope: a peer that has preferences/ or
+  // entities/ but no profile.md still yields its listings, and the profile falls
+  // through to user scope instead of being dropped.
+  const roots = [];
+  if (actorPeerId) roots.push(`viking://user/${space}/peers/${actorPeerId}/memories`);
+  roots.push(`viking://user/${space}/memories`);
+  const fallbackRoot = roots[roots.length - 1];
+
+  let profile = null;
+  let prefs = [];
+  let ents = [];
+  let profileUri = `${fallbackRoot}/profile.md`;
+  let prefUri = `${fallbackRoot}/preferences`;
+  let entUri = `${fallbackRoot}/entities`;
+
+  // Scopes are tried in order, but the categories still missing are read from a
+  // scope concurrently: they are independent, and a hook on the SessionStart path
+  // pays for every round trip. Once a category is filled it is not requested from
+  // the next scope, so a peer that supplies everything costs one scope's worth of
+  // reads rather than two.
+  for (const root of roots) {
+    const wantProfile = !profile;
+    const wantPrefs = prefs.length === 0;
+    const wantEnts = ents.length === 0;
+    if (!wantProfile && !wantPrefs && !wantEnts) break;
+
+    const [p, pr, en] = await Promise.all([
+      wantProfile ? readProfile(fetchJSON, `${root}/profile.md`, actorPeerId) : null,
+      wantPrefs ? lsDir(fetchJSON, `${root}/preferences`, actorPeerId) : [],
+      wantEnts ? lsDir(fetchJSON, `${root}/entities`, actorPeerId) : [],
+    ]);
+
+    if (p) {
+      profile = p;
+      profileUri = `${root}/profile.md`;
+    }
+    if (pr.length > 0) {
+      prefs = pr;
+      prefUri = `${root}/preferences`;
+    }
+    if (en.length > 0) {
+      ents = en;
+      entUri = `${root}/entities`;
+    }
+  }
+
+  const skills = formatSkillCatalog(await skillGroupsPromise, skillBudget);
 
   if (!profile && prefs.length === 0 && ents.length === 0 && skills.lines.length === 0) {
     return null;
