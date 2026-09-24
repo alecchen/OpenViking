@@ -2,10 +2,13 @@
  * Session-start profile injection helper.
  *
  * Builds a <user-profile> + <available-memories> (+ <available-skills>) block from
- *   viking://user/<space>/memories/profile.md
- *   viking://user/<space>/memories/preferences/   (ls with abstracts)
- *   viking://user/<space>/memories/entities/      (ls with abstracts)
- *   GET /api/v1/skills                            (own + account-shared skills)
+ *   viking://user/<space>[/peers/<peer>]/memories/profile.md
+ *   viking://user/<space>[/peers/<peer>]/memories/preferences/   (ls with abstracts)
+ *   viking://user/<space>[/peers/<peer>]/memories/entities/      (ls with abstracts)
+ *   GET /api/v1/skills                                           (own + account-shared skills)
+ *
+ * The scope is the actor peer's when buildProfileBlock receives an actorPeerId,
+ * and the user's otherwise: the same rule capture writes by.
  *
  * Budget enforced via the CJK-aware estimateTokens() below — codepoint >=
  * 0x3000 counts at 1.5 tokens, else chars/4. The estimator is exported so
@@ -378,64 +381,32 @@ export async function buildProfileBlock(fetchJSON, totalBudgetTokens, actorPeerI
   const skillBudget = Math.min(skillCatalogTokenBudget, Math.floor(capTokens / 4));
   const space = await resolveUserSpace(fetchJSON, actorPeerId);
 
-  // The skill catalog is account-wide, so it is read alongside the peer's own
-  // scope rather than one scope at a time.
+  // The skill catalog is account-wide, so it starts alongside the scope reads
+  // rather than after them.
   const skillGroupsPromise = skillCatalog && skillBudget > 0
     ? fetchSkillCatalog(fetchJSON, actorPeerId)
     : [];
 
-  // Each category is resolved on its own, peer scope first. A workspace peer
-  // keeps one project's memories under
-  // viking://user/<space>/peers/<peer>/memories, which is where capture writes,
-  // so it is the scope that normally wins. User scope stays as the fallback for
-  // non-repository workspaces and for memories written before peer scoping
-  // became the default.
-  //
-  // Per category rather than per scope: a peer that has preferences/ or
-  // entities/ but no profile.md still yields its listings, and the profile falls
-  // through to user scope instead of being dropped.
-  const roots = [];
-  if (actorPeerId) roots.push(`viking://user/${space}/peers/${actorPeerId}/memories`);
-  roots.push(`viking://user/${space}/memories`);
-  const fallbackRoot = roots[roots.length - 1];
+  // One scope per session, the same rule capture writes by: a message carrying a
+  // peer_id lands in viking://user/<space>/peers/<peer>/memories, one without it
+  // in viking://user/<space>/memories. An empty peer directory means nothing has
+  // been extracted for this workspace yet, not that the memory lives elsewhere.
+  // Per-turn recall searches both scopes whenever an actor is set, so this block
+  // does not need a fallback to cover user scope.
+  const root = actorPeerId
+    ? `viking://user/${space}/peers/${actorPeerId}/memories`
+    : `viking://user/${space}/memories`;
+  const profileUri = `${root}/profile.md`;
+  const prefUri = `${root}/preferences`;
+  const entUri = `${root}/entities`;
 
-  let profile = null;
-  let prefs = [];
-  let ents = [];
-  let profileUri = `${fallbackRoot}/profile.md`;
-  let prefUri = `${fallbackRoot}/preferences`;
-  let entUri = `${fallbackRoot}/entities`;
-
-  // Scopes are tried in order, but the categories still missing are read from a
-  // scope concurrently: they are independent, and a hook on the SessionStart path
-  // pays for every round trip. Once a category is filled it is not requested from
-  // the next scope, so a peer that supplies everything costs one scope's worth of
-  // reads rather than two.
-  for (const root of roots) {
-    const wantProfile = !profile;
-    const wantPrefs = prefs.length === 0;
-    const wantEnts = ents.length === 0;
-    if (!wantProfile && !wantPrefs && !wantEnts) break;
-
-    const [p, pr, en] = await Promise.all([
-      wantProfile ? readProfile(fetchJSON, `${root}/profile.md`, actorPeerId) : null,
-      wantPrefs ? lsDir(fetchJSON, `${root}/preferences`, actorPeerId) : [],
-      wantEnts ? lsDir(fetchJSON, `${root}/entities`, actorPeerId) : [],
-    ]);
-
-    if (p) {
-      profile = p;
-      profileUri = `${root}/profile.md`;
-    }
-    if (pr.length > 0) {
-      prefs = pr;
-      prefUri = `${root}/preferences`;
-    }
-    if (en.length > 0) {
-      ents = en;
-      entUri = `${root}/entities`;
-    }
-  }
+  // The three reads are independent, and a hook on the SessionStart path pays
+  // for every round trip.
+  const [profile, prefs, ents] = await Promise.all([
+    readProfile(fetchJSON, profileUri, actorPeerId),
+    lsDir(fetchJSON, prefUri, actorPeerId),
+    lsDir(fetchJSON, entUri, actorPeerId),
+  ]);
 
   const skills = formatSkillCatalog(await skillGroupsPromise, skillBudget);
 
