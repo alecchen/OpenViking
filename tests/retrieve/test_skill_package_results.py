@@ -17,6 +17,7 @@ from openviking_cli.retrieve.types import (
     TypedQuery,
 )
 from openviking_cli.session.user_id import UserIdentifier
+from openviking_cli.utils.config import RerankConfig
 
 SKILLS = "viking://agent/skills"
 
@@ -54,16 +55,18 @@ class Files:
 class PagedStore:
     collection_name = "context"
 
-    def __init__(self, records=(), children=None):
+    def __init__(self, records=()):
         self.records = list(records)
-        self.children = children or {}
         self.calls = []
-        self.child_calls = []
 
-    def _acl_enabled(self, ctx):
+    async def _acl_enabled(self, ctx):
         return False
 
-    async def collection_exists_bound(self):
+    async def get_account_backend(self, account_id):
+        assert account_id
+        return self
+
+    async def collection_exists(self):
         return True
 
     def _page(self, records, kwargs):
@@ -93,10 +96,6 @@ class PagedStore:
     async def filter_in_tenant(self, ctx, **kwargs):
         self.calls.append(kwargs)
         return self._page(self.records, kwargs)
-
-    async def search_children_in_tenant(self, ctx, parent_uri, **kwargs):
-        self.child_calls.append({"parent_uri": parent_uri, **kwargs})
-        return self._page(self.children.get(parent_uri, []), kwargs)
 
 
 def query(target=SKILLS):
@@ -218,3 +217,24 @@ async def test_package_abstract_reports_only_a_generated_abstract(answer, expect
 
     assert await package_abstract(fs, request_ctx, f"{SKILLS}/demo") == expected
     assert fs.calls == [(f"{SKILLS}/demo", request_ctx)]
+
+
+@pytest.mark.asyncio
+async def test_rerank_threshold_does_not_filter_package_vector_scores():
+    """Package search never reranks; only an explicit threshold filters its vector scores."""
+    store = PagedStore([row(f"{SKILLS}/a/SKILL.md", 0.9), row(f"{SKILLS}/b/SKILL.md", 0.05)])
+    retriever = SkillPackageRetriever(store, None, rerank_config=RerankConfig(threshold=0.8))
+
+    result = await retriever.retrieve_skills(
+        query(), ctx(), limit=5, skill_resolver=SkillResultResolver(Files(), ctx())
+    )
+    explicit = await retriever.retrieve_skills(
+        query(),
+        ctx(),
+        limit=5,
+        score_threshold=0.5,
+        skill_resolver=SkillResultResolver(Files(), ctx()),
+    )
+
+    assert [item.score for item in result.matched_contexts] == [0.9, 0.05]
+    assert [item.score for item in explicit.matched_contexts] == [0.9]

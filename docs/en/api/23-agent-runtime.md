@@ -22,6 +22,8 @@ Agent Runtime Server executes Agent tasks and currently supports Compile. Applic
 
 The entire `args` object is optional, and the model endpoint ID is not a top-level field. Use `args.model_name` to select a model; when omitted, the execution backend uses its default model configuration.
 
+The model-selection examples below require a backend that accepts `args.model_name`. When using bundled VikingBot, omit `args` and CLI `--args`; it rejects non-empty arguments. The Python example uses `SyncHTTPClient`; await `compile()` with `AsyncHTTPClient`.
+
 **HTTP API**
 
 ```http
@@ -32,6 +34,7 @@ POST /api/v1/compile
 curl -X POST http://localhost:1933/api/v1/compile \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
+  -H "Idempotency-Key: studio-compile-001" \
   -d '{
     "from": ["viking://resources/research"],
     "to": "viking://resources/research-wiki",
@@ -107,6 +110,26 @@ task, err := client.Compile(
 
 :::
 
+### Target settings and operation history
+
+These endpoints use the current account and authentication context. `to` is the registered target's `viking://` URI. Reading or updating one target requires write access; listing targets returns only accessible targets.
+
+| HTTP API | Description and result (`status: "ok"`) |
+|----------|------------------------|
+| `GET /api/v1/compile/config?to={to}` | `result` contains target settings and run status |
+| `POST /api/v1/compile/config/update` | Required JSON body field `to` identifies the registered Compile output directory to configure; `result` contains the updated settings and run status |
+| `GET /api/v1/compile/configs` | Optional query parameters: `limit` (1–100, default 20) and `cursor`; `result.targets` contains this page of visible target summaries ordered by `target_id` ascending; pass `result.next_cursor` unchanged as the next page's `cursor`; null marks the last page |
+| `GET /api/v1/compile/operations?to={to}` | `result.operations` contains operations, newest first; `result.next_cursor` continues pagination |
+| `GET /api/v1/compile/operations/{operation_id}/outputs?to={to}` | `result.outputs` contains output files and frozen version references, ordered by URI; `result.next_cursor` continues pagination |
+
+The update body requires `to`, `from` (a non-empty source URI array), `skill`, and `auto_update` (boolean). When `auto_update=true`, a valid `update_schedule` is required. When `auto_update=false`, the schedule can be omitted or null; the saved rule is cleared and the returned value is null. New targets have no default rule, and enabling updates after disabling them requires a rule. Optional `instruction` preserves the saved value when omitted; `null` or an empty string clears it. Updating settings does not submit a Compile task.
+
+`update_schedule` requires `frequency` (`daily` or `weekly`). Optional `hour` (0–23) and `minute` (0–59) default to 0. Weekly schedules also accept `weekday` (1=Monday through 7=Sunday, default 1). Schedules use `Asia/Shanghai` time.
+
+Scheduled updates require `compile_api.scheduler_enabled=true` (default `false`) and valid `expiry.service_name` and `expiry.redis` configuration. `compile_api.scheduler_backend` only accepts `redis` (the default); `local` is invalid. Enabling `auto_update` while scheduling is disabled returns `COMPILE_SCHEDULER_DISABLED`. Manual incremental Compile and version management do not require Redis.
+
+Both history endpoints accept optional query parameters `limit` (1–100, default 20) and `cursor`. Pass the returned `next_cursor` unchanged; `null` marks the last page. `operation_id` is 1–128 characters, starts with a letter or digit, and otherwise allows letters, digits, `:`, `.`, `_`, and `-`. Operations remain queryable after target deletion. Missing targets, operations, or output manifests return `404`. A null `version_id` or `snapshot_id` on an output item indicates that the corresponding reference is unavailable.
+
 ### Check Compile availability
 
 ```http
@@ -134,6 +157,14 @@ Uses the current authentication context and takes no request parameters. Returns
 
 An unavailable configuration is reported in the result with `can_create: false`, not as an HTTP error. This checks configuration and credentials; it does not probe backend health or validate a particular Compile request.
 
+### Compile routing embeddings
+
+`POST /api/v1/compile/embeddings` embeds transient routing texts using the current authentication context, without indexing or retaining them.
+
+Body: required `target_uri` (an existing resource or Skill namespace target with read access); optional `texts` (string array, default `[]`, at most 32 texts, each 1–1024 characters and not whitespace-only); optional `expected_model` (model fingerprint; a non-empty value must match the current model).
+
+Returns `200 OK` with `status: "ok"` and `result: {"model": "...", "vectors": [...]}`. Vectors follow input order; empty `texts` returns only the model fingerprint and an empty vector array.
+
 ### Find a task by submission key
 
 ```http
@@ -151,13 +182,13 @@ curl http://localhost:1933/api/v1/compile/submissions/studio-compile-001 \
   -H "X-API-Key: your-key"
 ```
 
-Returns `200 OK` with `status: "ok"` and the existing OV task record in `result`, using the same structure as the task creation response above. Lookup is scoped to the current account and user and does not create a task. A missing submission, including a key used only by another user, returns `404`; an invalid key returns `422`.
+Returns `200 OK` with `status: "ok"` and the existing OV task record in `result`, using the same structure as the task creation response above. Lookup is scoped to the current account and user and does not create a task. A missing submission, including a key used only by another user, returns `404`; an invalid key returns `400 INVALID_ARGUMENT`.
 
 To retry creation safely, reuse the same `Idempotency-Key` and request parameters. A key reused with different parameters returns `409`. Without this header, creation does not provide a submission key for this lookup.
 
 ### Get task status
 
-A task is visible only to the principal that created it. A missing task and a task owned by another principal both return `404`.
+For ordinary user requests, a task is visible only to its creator; missing tasks and tasks owned by another user return `404`. ROOT queries have separate administrative visibility and cannot cancel tasks.
 
 ```http
 GET /api/v1/tasks/{task_id}

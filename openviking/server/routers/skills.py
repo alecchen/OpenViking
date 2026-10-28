@@ -14,7 +14,7 @@ from typing import Any, AsyncIterator, Dict, Optional
 import yaml
 from fastapi import APIRouter, Depends, Request
 from fastapi import Path as ApiPath
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openviking.core.namespace import canonical_user_root
 from openviking.core.path_variables import resolve_path_variables
@@ -69,7 +69,11 @@ class UpdateSkillRequest(BaseModel):
     temp_file_id: Optional[str] = None
     from_source: bool = False
     wait: bool = False
-    timeout: Optional[float] = None
+    timeout: float | None = Field(
+        default=None,
+        deprecated=True,
+        description="Deprecated compatibility parameter; accepted and ignored.",
+    )
     source_metadata: Optional[Dict[str, Any]] = None
     telemetry: TelemetryRequest = False
     target_uri: Optional[str] = None
@@ -138,13 +142,14 @@ async def _list_skills_from_root(
     nested directories like ``<skill>/scripts`` out of the listing.
     """
     try:
-        entries = await service.fs.ls(
+        page = await service.fs.ls(
             root_uri,
             ctx=ctx,
             output="agent",
             abs_limit=1024,
             node_limit=node_limit,
         )
+        entries = page.entries
     except NotFoundError:
         return []
 
@@ -322,7 +327,7 @@ async def _list_skill_files(
         child_limit = max(node_limit - len(entries), 0)
         if child_limit <= 0:
             break
-        children = await service.fs.ls(
+        page = await service.fs.ls(
             current_uri,
             ctx=ctx,
             output="agent",
@@ -330,6 +335,7 @@ async def _list_skill_files(
             show_all_hidden=True,
             node_limit=child_limit,
         )
+        children = page.entries
         for entry in children:
             if not isinstance(entry, dict):
                 continue
@@ -632,7 +638,7 @@ async def find_skills(
 
         # Both finds embed the same query text, so wrap the fan-out in the
         # request-scoped cache to reuse the first in-flight embed.
-        with query_embed_cache_scope():
+        async with query_embed_cache_scope():
             user_execution, agent_execution = await asyncio.gather(
                 run_operation(
                     operation="skills.find",
@@ -981,7 +987,6 @@ async def update_skill(
                     data=preparation,
                     ctx=_ctx,
                     wait=request.wait,
-                    timeout=request.timeout,
                     allow_local_path_resolution=False,
                     source_path_hint=source_path_hint,
                     apply_privacy=False,

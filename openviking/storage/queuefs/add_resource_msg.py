@@ -22,6 +22,7 @@ class AddResourceMsg:
     user_id: str
     group_ids: list[str] = field(default_factory=list)
     role: str
+    _task_work_id: str = ""
     path: str = ""
     source_path: str = ""
     telemetry_id: Optional[str] = None
@@ -34,7 +35,6 @@ class AddResourceMsg:
     bypass_acl: bool = False
     reason: str = ""
     instruction: str = ""
-    timeout: Optional[float] = None
     build_index: bool = True
     summarize: bool = False
     strict: bool = False
@@ -110,6 +110,7 @@ class AddResourceMsg:
         task_id = data.get("task_id")
         path = data.get("path")
         root_uri = data.get("root_uri")
+        account_id = data.get("account_id")
         prepared = data.get("prepared") if isinstance(data.get("prepared"), dict) else None
         staged_source = None
         if data.get("staged_source") is not None:
@@ -139,7 +140,13 @@ class AddResourceMsg:
         if prepared is not None:
             args.clear()
         has_source_payload = bool(prepared or staged_source or shared_source)
-        if not task_id or (not path and not has_source_payload) or not root_uri:
+        if (
+            not task_id
+            or (not path and not has_source_payload)
+            or not root_uri
+            or not isinstance(account_id, str)
+            or not account_id.strip()
+        ):
             missing = []
             if not task_id:
                 missing.append("task_id")
@@ -147,14 +154,17 @@ class AddResourceMsg:
                 missing.append("path, prepared, staged_source, or shared_source")
             if not root_uri:
                 missing.append("root_uri")
+            if not isinstance(account_id, str) or not account_id.strip():
+                missing.append("account_id")
             raise ValueError(f"Missing required fields: {missing}")
 
         return cls(
             task_id=str(task_id),
+            _task_work_id=str(data.get("_task_work_id") or ""),
             path=str(path or ""),
             source_path=str(data.get("source_path") or path or ""),
             root_uri=str(root_uri),
-            account_id=str(data.get("account_id", "default")),
+            account_id=account_id,
             user_id=str(data.get("user_id", "default")),
             group_ids=(
                 [str(group_id) for group_id in data["group_ids"]]
@@ -172,7 +182,6 @@ class AddResourceMsg:
             else None,
             reason=str(data.get("reason", "")),
             instruction=str(data.get("instruction", "")),
-            timeout=float(data["timeout"]) if data.get("timeout") is not None else None,
             build_index=bool(data.get("build_index", True)),
             summarize=bool(data.get("summarize", False)),
             strict=bool(data.get("strict", False)),

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+
 from .actor_peer import get_actor_peer_id, use_actor_peer
 from .client import AsyncHTTPClient, SyncHTTPClient
 from .errors import (
@@ -20,14 +23,19 @@ from .options import (
     ExperienceOutcomeOptions,
     ExperienceTrajectoryOptions,
     FindOptions,
+    ListPage,
     Message,
     PreflightAssetOptions,
     ReindexOptions,
     ResolveAssetsOptions,
+    RuleCompileOptions,
+    RuleCompileSource,
+    RuleSearchOptions,
     SearchContextOptions,
     SearchContextResult,
     SearchOptions,
     SetTagsOptions,
+    TreePage,
     UpdateSessionConfigOptions,
     UpdateSkillOptions,
     WriteOptions,
@@ -51,6 +59,7 @@ __all__ = [
     "FindOptions",
     "get_actor_peer_id",
     "ImagePart",
+    "ListPage",
     "Message",
     "MessagePart",
     "OpenVikingError",
@@ -58,6 +67,9 @@ __all__ = [
     "ReindexOptions",
     "ResourceExhaustedError",
     "ResolveAssetsOptions",
+    "RuleCompileOptions",
+    "RuleCompileSource",
+    "RuleSearchOptions",
     "SearchContextOptions",
     "SearchContextResult",
     "SearchOptions",
@@ -65,6 +77,7 @@ __all__ = [
     "SyncHTTPClient",
     "TextPart",
     "ToolPart",
+    "TreePage",
     "UnimplementedError",
     "UpdateSessionConfigOptions",
     "UpdateSkillOptions",

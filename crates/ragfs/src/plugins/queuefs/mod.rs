@@ -79,6 +79,17 @@ const CONTROL_FILES: &[ControlFileSpec] = &[
 struct QueueMessage {
     id: String,
     data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp: Option<f64>,
+}
+
+fn queue_message_timestamp(msg: &Message) -> Option<f64> {
+    msg.timestamp_valid.then(|| {
+        msg.timestamp
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,7 +106,7 @@ struct ParsedBackendConfig {
     sqlite_db_path: Option<String>,
     sqlite_options: SQLiteQueueOptions,
     #[cfg(feature = "cache")]
-    cache_key_prefix: Option<String>,
+    service_name: Option<String>,
 }
 
 /// Parsed path information
@@ -374,9 +385,11 @@ impl FileSystem for QueueFileSystem {
                 };
                 // Return in Go libagfsbinding format: {"id": "...", "data": "..."}
                 let data_str = String::from_utf8_lossy(&msg.data).to_string();
+                let timestamp = queue_message_timestamp(&msg);
                 let response = QueueMessage {
                     id: msg.id,
                     data: data_str,
+                    timestamp,
                 };
                 Ok(serde_json::to_vec(&response)?)
             }
@@ -389,6 +402,7 @@ impl FileSystem for QueueFileSystem {
                 let response = QueueMessage {
                     id: msg.id.clone(),
                     data: data_str,
+                    timestamp: queue_message_timestamp(&msg),
                 };
                 Ok(serde_json::to_vec(&response)?)
             }
@@ -406,9 +420,13 @@ impl FileSystem for QueueFileSystem {
                     .list_unacked(&queue_name)
                     .await?
                     .into_iter()
-                    .map(|msg| QueueMessage {
+                .map(|msg| {
+                    let timestamp = queue_message_timestamp(&msg);
+                    QueueMessage {
                         id: msg.id,
                         data: String::from_utf8_lossy(&msg.data).to_string(),
+                        timestamp,
+                    }
                     })
                     .collect::<Vec<_>>();
                 Ok(serde_json::to_vec(&messages)?)
@@ -671,11 +689,9 @@ impl QueueFSPlugin {
                     "SQLite busy timeout in milliseconds",
                 ),
                 #[cfg(feature = "cache")]
-                ConfigParameter::optional(
-                    "cache_key_prefix",
-                    "string",
-                    "default",
-                    "Queue key namespace when backend=cache",
+                ConfigParameter::required_string(
+                    "service_name",
+                    "OpenViking service name when backend=cache",
                 ),
             ],
             #[cfg(feature = "cache")]
@@ -758,18 +774,22 @@ impl QueueFSPlugin {
             }
         };
         #[cfg(feature = "cache")]
-        let cache_key_prefix = match kind {
+        let service_name = match kind {
             BackendKind::Cache => {
-                let prefix = Self::get_string_param(config, "cache_key_prefix")
-                    .unwrap_or("default")
+                let service_name = Self::get_string_param(config, "service_name")
+                    .ok_or_else(|| {
+                        Error::config(
+                            "queuefs service_name is required when backend=cache".to_string(),
+                        )
+                    })?
                     .to_string();
-                if prefix.trim().is_empty() || prefix.contains(['{', '}']) {
+                if service_name.trim().is_empty() || service_name.contains(['{', '}']) {
                     return Err(Error::config(
-                        "queuefs cache_key_prefix must be non-empty and must not contain '{' or '}'"
+                        "queuefs service_name must be non-empty and must not contain '{' or '}'"
                             .to_string(),
                     ));
                 }
-                Some(prefix)
+                Some(service_name)
             }
             _ => None,
         };
@@ -782,7 +802,7 @@ impl QueueFSPlugin {
                 busy_timeout_ms,
             },
             #[cfg(feature = "cache")]
-            cache_key_prefix,
+            service_name,
         })
     }
 }
@@ -872,8 +892,8 @@ impl ServicePlugin for QueueFSPlugin {
                             .expect("cache runtime is validated")
                             .clone(),
                         parsed
-                            .cache_key_prefix
-                            .expect("cache key prefix is validated"),
+                            .service_name
+                            .expect("queuefs service_name is validated"),
                     )
                     .await?,
                 ));
@@ -898,6 +918,18 @@ mod tests {
     struct TestQueueMessage {
         id: String,
         data: String,
+        timestamp: Option<f64>,
+    }
+
+    #[test]
+    fn test_queue_message_omits_missing_timestamp() {
+        let response = QueueMessage {
+            id: "legacy".to_string(),
+            data: "payload".to_string(),
+            timestamp: None,
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert!(value.get("timestamp").is_none());
     }
 
     /// Create a queue filesystem with one initialized queue.
@@ -940,10 +972,12 @@ mod tests {
         let msg1 = dequeue_msg(&fs, "test").await;
         assert!(!msg1.id.is_empty());
         assert_eq!(msg1.data.as_bytes(), data1);
+        assert!(msg1.timestamp.is_some_and(|value| value > 0.0));
 
         let msg2 = dequeue_msg(&fs, "test").await;
         assert!(!msg2.id.is_empty());
         assert_eq!(msg2.data.as_bytes(), data2);
+        assert!(msg2.timestamp.is_some_and(|value| value > 0.0));
 
         // Queue should be empty
         let result = fs.read("/test/dequeue", 0, 0).await.unwrap();
@@ -1134,7 +1168,7 @@ mod tests {
         #[cfg(feature = "cache")]
         assert!(config_params
             .iter()
-            .any(|parameter| parameter.name == "cache_key_prefix"));
+            .any(|parameter| parameter.name == "service_name"));
 
         let config =
             PluginConfig::single_backend("queuefs", "/queue", std::collections::HashMap::new());
@@ -1296,7 +1330,14 @@ mod tests {
     #[cfg(feature = "cache")]
     #[tokio::test]
     async fn cache_runtime_failure_is_propagated_by_stat_and_read_dir() {
-        let provider = std::sync::Arc::new(crate::cache_runtime::MemoryMockProvider::new());
+        let provider = std::sync::Arc::new(
+            crate::cache_runtime::MemoryMockProvider::new().with_script_handler(|request| {
+                panic!(
+                    "script execution is outside this failure propagation test's scope: {}",
+                    request.script_id
+                )
+            }),
+        );
         let runtime = crate::cache_runtime::CacheRuntime::memory_with_provider(provider.clone());
         let fs = QueueFileSystem::with_cache_runtime(runtime, "queuefs-runtime-errors".to_string())
             .await

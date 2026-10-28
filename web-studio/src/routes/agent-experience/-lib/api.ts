@@ -1,3 +1,4 @@
+import i18n from '#/i18n/core'
 import { getOvResult, isOvClientError, ovClient } from '#/lib/ov-client'
 
 import {
@@ -39,7 +40,8 @@ export async function fetchExperiences(options: {
         url: '/api/v1/fs/ls',
       }),
     )
-    if (!Array.isArray(result)) throw new Error('Invalid fs/ls response')
+    if (!Array.isArray(result))
+      throw new Error(i18n.t('studio:errors.invalidDirectoryResponse'))
     return {
       items: normalizeExperienceFiles(result.slice(0, pageSize)),
       hasMore: result.length > pageSize,
@@ -52,6 +54,49 @@ export async function fetchExperiences(options: {
     }
     throw error
   }
+}
+
+/** Search indexed experience files in this user's experience directory. */
+export async function searchExperiences(options: {
+  experiencesUri: string
+  keyword: string
+  signal?: AbortSignal
+}): Promise<ExperiencePage> {
+  const { experiencesUri, keyword, signal } = options
+  const result = await getOvResult<unknown>(
+    ovClient.client.post({
+      body: {
+        query: keyword,
+        target_uri: experiencesUri,
+        context_type: 'memory',
+        level: 2,
+        limit: 100,
+      },
+      signal,
+      url: '/api/v1/search/find',
+    }),
+  )
+  const memories =
+    result && typeof result === 'object' && 'memories' in result
+      ? (result as { memories?: unknown }).memories
+      : undefined
+  const prefix = `${experiencesUri.replace(/\/$/, '')}/`
+  const items = Array.isArray(memories)
+    ? memories.flatMap((match) => {
+        if (
+          !match ||
+          typeof match !== 'object' ||
+          typeof match.uri !== 'string'
+        )
+          return []
+        const uri = match.uri as string
+        const name = uri.startsWith(prefix) ? uri.slice(prefix.length) : ''
+        return name && !name.includes('/') && name.endsWith('.md')
+          ? [{ name, uri }]
+          : []
+      })
+    : []
+  return { items, hasMore: false, page: 1, pageSize: items.length }
 }
 
 export async function fetchContent(

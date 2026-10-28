@@ -11,7 +11,7 @@ from openviking.core.context import Context, ContextLevel
 from openviking.core.namespace import owner_fields_for_uri
 from openviking.storage.index_action import IndexAction
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
-from openviking.telemetry import get_current_telemetry
+from openviking.telemetry import get_current_telemetry, get_ingestion_source_type
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
@@ -24,6 +24,8 @@ class EmbeddingMsgConverter:
     def from_context(
         context: Context,
         action: IndexAction = IndexAction.MERGE,
+        *,
+        telemetry_id: str | None = None,
     ) -> EmbeddingMsg | None:
         """
         Convert a Context object to EmbeddingMsg.
@@ -41,10 +43,12 @@ class EmbeddingMsgConverter:
 
         context_data = context.to_dict()
 
-        # Backfill tenant fields for legacy writers that only set user/uri.
-        if not context_data.get("account_id"):
-            user = context_data.get("user") or {}
-            context_data["account_id"] = user.get("account_id", "default")
+        # Account identity is required at the queue boundary. Do not silently
+        # route a malformed or legacy message to the default Account.
+        if not isinstance(context_data.get("account_id"), str) or not context_data[
+            "account_id"
+        ].strip():
+            raise ValueError("Embedding context requires account_id")
         uri = context_data.get("uri", "")
         owner_fields = None
         if uri:
@@ -54,7 +58,7 @@ class EmbeddingMsgConverter:
             if owner_fields is not None:
                 context_data["owner_user_id"] = owner_fields["owner_user_id"]
 
-        # Derive level field for hierarchical retrieval.
+        # Derive the level field used by retrieval filters.
         uri = context_data.get("uri", "")
         context_level = context.level
         if context_level is not None:
@@ -87,10 +91,15 @@ class EmbeddingMsgConverter:
         else:
             message = vectorization_text
 
+        source_type = get_ingestion_source_type()
+
         embedding_msg = EmbeddingMsg.for_embed(
             message=message,
             context_data=context_data,
-            telemetry_id=get_current_telemetry().telemetry_id,
+            telemetry_id=(
+                get_current_telemetry().telemetry_id if telemetry_id is None else telemetry_id
+            ),
             action=action,
+            source_type=source_type or "",
         )
         return embedding_msg

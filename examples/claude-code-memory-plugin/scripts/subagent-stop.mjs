@@ -12,11 +12,16 @@
  * created in subagent-start.mjs. An immediate commit runs so the subagent's
  * context is archived before the parent continues.
  *
+ * A subagent can stop more than once (woken again by a background task
+ * notification or SendMessage), and each stop hands us the whole transcript.
+ * The state file keeps a capturedTurnCount cursor, like auto-capture, so later
+ * stops push and commit only the turns added since the previous one.
+ *
  * Each subagent is written to a distinct OpenViking session derived from the
  * parent session id and Claude's subagent id.
  */
 
-import { readFile, unlink } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { isPluginEnabled, loadConfig } from "./config.mjs";
@@ -33,7 +38,7 @@ import { maybeDetach, readHookStdin } from "./lib/async-writer.mjs";
 import { getEffectivePeerId } from "./lib/workspace-peer.mjs";
 import { runHookStage } from "./shared/agent-hook-runtime.mjs";
 import { sendSessionMessages } from "./shared/batch-send.mjs";
-import { filterCaptureParts } from "./shared/capture-utils.mjs";
+import { shapeCaptureParts } from "./shared/capture-utils.mjs";
 
 if (!isPluginEnabled()) {
   process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
@@ -71,6 +76,15 @@ async function loadState(subagentId) {
   }
 }
 
+async function saveState(subagentId, state) {
+  try {
+    await mkdir(STATE_DIR, { recursive: true });
+    await writeFile(stateFile(subagentId), JSON.stringify(state));
+  } catch (err) {
+    logError("state_write", err);
+  }
+}
+
 async function pushTurns(cfg, ovSessionId, turns, { peerId = null, enqueueOnly = false } = {}) {
   const fetchJSON = makeFetchJSON(cfg);
   let ok = 0;
@@ -81,8 +95,8 @@ async function pushTurns(cfg, ovSessionId, turns, { peerId = null, enqueueOnly =
   for (const turn of turns) {
     // Send structured parts: tool calls/results are dedicated `tool` parts, not
     // inlined into content, so the server can process them separately.
-    // Blank text parts are pruned and the configured capture filters applied.
-    const parts = filterCaptureParts(turn.parts, turn.role, cfg).parts;
+    // Sanitize injected context before applying the configured filters.
+    const parts = shapeCaptureParts(turn.parts, turn.role, cfg).parts;
     if (parts.length === 0) continue;
     const payload = { role: turn.role, parts };
     if (peerId) payload.peer_id = peerId;
@@ -171,14 +185,23 @@ async function main() {
 
     const messages = parseTranscript(transcript);
     const turns = extractCaptureTurns(messages, cfg);
+    const capturedTurnCount = state?.capturedTurnCount || 0;
+    const newTurns = turns.slice(capturedTurnCount);
     log("transcript_parse", {
       subagentId,
       ovSessionId,
       totalTurns: turns.length,
+      previouslyCaptured: capturedTurnCount,
+      newTurns: newTurns.length,
     });
 
     if (turns.length === 0) {
       await unlink(stateFile(subagentId)).catch(() => {});
+      return;
+    }
+
+    if (newTurns.length === 0) {
+      log("skip", { reason: "no new turns" });
       return;
     }
 
@@ -187,10 +210,10 @@ async function main() {
     const health = await fetchJSON("/health");
     let result;
     if (health.ok) {
-      result = await pushTurns(cfg, ovSessionId, turns, { peerId });
+      result = await pushTurns(cfg, ovSessionId, newTurns, { peerId });
     } else if (isRetryableFailure(health)) {
       logError("health_check", "server unreachable; enqueuing subagent capture");
-      result = await pushTurns(cfg, ovSessionId, turns, { peerId, enqueueOnly: true });
+      result = await pushTurns(cfg, ovSessionId, newTurns, { peerId, enqueueOnly: true });
     } else {
       logError("health_check", `non-retryable status ${health.status || "unknown"}`);
       return;
@@ -198,11 +221,11 @@ async function main() {
     log("push_turns", { ovSessionId, ...result });
 
     if (result.enqueueFailed > 0) {
-      logError("pending_enqueue", "some turns failed to enqueue; state file retained");
+      logError("pending_enqueue", "some turns failed to enqueue; state not advanced");
       return;
     }
 
-    await unlink(stateFile(subagentId)).catch(() => {});
+    await saveState(subagentId, { ...state, ovSessionId, capturedTurnCount: turns.length });
   });
 }
 

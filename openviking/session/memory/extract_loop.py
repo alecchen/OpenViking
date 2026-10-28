@@ -30,11 +30,18 @@ from openviking.session.memory.extraction_output_protocol import (
     create_extraction_output_protocol,
 )
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
-from openviking.session.memory.merge_op import FieldType, ImmutableOp, MergeOp, PatchOp
+from openviking.session.memory.merge_op import (
+    FieldType,
+    ImmutableOp,
+    MergeOp,
+    MergeOpFactory,
+    PatchOp,
+)
 from openviking.session.memory.page_id_map import ResponsePageIdAllocator
 from openviking.session.memory.schema_model_generator import SchemaModelGenerator
 from openviking.session.memory.tools import MEMORY_TOOLS_REGISTRY
 from openviking.session.memory.utils.json_parser import JsonUtils
+from openviking.session.memory.utils.uri import generate_uri
 from openviking.storage.viking_fs import VikingFS, get_viking_fs
 from openviking.telemetry import bind_telemetry_stage, tracer
 from openviking_cli.utils import get_logger
@@ -127,7 +134,7 @@ class ExtractLoop:
         ctx: Optional[RequestContext] = None,
         context_provider: Optional[Any] = None,  # ExtractContextProvider
         isolation_handler: MemoryIsolationHandler = None,
-        thinking: bool = False,
+        thinking: Optional[bool] = None,
         max_output_tokens: Optional[int] = None,
     ):
         """
@@ -140,7 +147,9 @@ class ExtractLoop:
             max_iterations: Maximum number of ReAct iterations (default: 5)
             ctx: Request context
             context_provider: ExtractContextProvider - 必须提供（由 provider 加载 schema）
-            thinking: Whether to explicitly enable model thinking for this extraction loop.
+            thinking: Per-call thinking override for this extraction loop. True/False
+                force the mode for every call; None (default) defers to the VLM
+                backend's configured thinking policy.
             max_output_tokens: Per-call output cap for the extraction LLM. When None, the
                 configured vlm.max_tokens is used, falling back to a value large enough for
                 full memory rewrites so providers do not apply a small server-side default
@@ -152,7 +161,7 @@ class ExtractLoop:
         self.max_iterations = max_iterations
         self.ctx = ctx
         self.context_provider = context_provider
-        self.thinking = bool(thinking)
+        self.thinking = thinking
         self.max_output_tokens = max_output_tokens
         # Resolved in run() via _resolve_effective_max_output_tokens(); default to
         # the extraction floor so a direct _call_llm() before run() stays safe.
@@ -229,7 +238,7 @@ class ExtractLoop:
         config = get_openviking_config()
         self._link_enabled = config.memory.link_enabled if config.memory else False
 
-        self._resolve_effective_max_output_tokens(config)
+        self._resolve_effective_max_output_tokens()
 
         # 获取 ExtractContext（整个流程复用）
         self._extract_context = self.context_provider.get_extract_context()
@@ -264,16 +273,14 @@ class ExtractLoop:
             self.context_provider.instruction()
         )
         output_contract = self._output_protocol.render_contract(self._output_context)
+        context_rules = self._output_protocol.render_context_rules(self._output_context)
         messages.append(
             {
                 "role": "system",
                 "content": f"""
 {provider_instruction}
 {reference_rules}
-## Read Format Rules
-- The read tool accepts `uri`, optional `offset` (0-indexed), and optional `limit`.
-- Read content is returned in Claude Code format: each visible line is prefixed with `line_number<TAB>`.
-- When you copy text from read results into SEARCH/REPLACE or DELETE operations, copy the exact text after the line-number prefix. Never include the line-number prefix itself in `search`, `replace`, or `delete`.
+{context_rules}
 {output_contract}
         """,
             }
@@ -397,10 +404,21 @@ class ExtractLoop:
             parse_error = self._last_parse_error
             # Add format error message if parse failed (max 1 retry). This may raise
             # max_iterations, granting one more attempt after this failure.
+            if failure_kind == "budget_exhausted":
+                # Truncation is not an ordinary format mistake: a same-cap format
+                # retry would only hit the budget again, and replaying the
+                # truncated output just grows the prompt. Fail fast with the
+                # dedicated error recorded by _call_llm().
+                raise RuntimeError(
+                    f"Memory extraction aborted: {parse_error or failure_kind}"
+                )
+
             if self._format_retry_count == 0:
                 self._format_retry_count += 1
                 max_iterations += 1
-                retry_reason = "refusal_text" if failure_kind == "refusal_text" else "format_retry"
+                retry_reason = (
+                    "refusal_text" if failure_kind == "refusal_text" else "format_retry"
+                )
                 tracer.info(f"Extended max_iterations to {max_iterations} for {retry_reason}")
                 self._add_format_error_message(messages)
 
@@ -458,22 +476,39 @@ class ExtractLoop:
 
         return final_operations, tools_used
 
-    def _resolve_effective_max_output_tokens(self, config: Any = None) -> None:
+    def _resolve_effective_max_output_tokens(self) -> None:
         """Resolve the extraction output cap.
 
-        Priority: explicit per-loop value > configured vlm.max_tokens >
+        Priority: explicit per-loop value > resolved VLM max_tokens >
         _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS. The default is a functional floor
         that suits the primary Doubao models; a model with a lower max output
         (e.g. gpt-4o-mini) must set vlm.max_tokens in ov.conf to override it.
         """
-        if config is None:
-            config = get_openviking_config()
         if self.max_output_tokens is not None:
             self._effective_max_output_tokens = self.max_output_tokens
             return
-        configured = getattr(getattr(config, "vlm", None), "max_tokens", None)
+        configured = getattr(self.vlm, "max_tokens", None)
         self._effective_max_output_tokens = (
             configured if configured is not None else _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS
+        )
+
+    def _budget_exhausted_error(self, response: Any, content: str) -> str:
+        """Build the dedicated, actionable error for a truncated response.
+
+        Truncation is detected only from the backend's explicit
+        ``finish_reason == "length"``; token counters are never used to infer it.
+        """
+        usage = getattr(response, "usage", None)
+        completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+        details = (
+            f"finish_reason='length', output cap={self._effective_max_output_tokens} tokens"
+        )
+        if completion_tokens:
+            details += f", completion_tokens={completion_tokens}"
+        return (
+            "Response was cut off by the output-token budget "
+            f"({details}), response_preview={_preview_text(content)!r}. "
+            "Raise vlm.max_tokens in ov.conf or reduce the memory context before retrying."
         )
 
     def _retryable_resolution_issues(self, operations: ResolvedOperations) -> List[Dict[str, Any]]:
@@ -487,10 +522,11 @@ class ExtractLoop:
                 or resolution_skip.reason_code not in _EVENT_RETRYABLE_RESOLUTION_SKIP_CODES
             ):
                 continue
-            if resolution_skip.reason_code == MemoryOperationSkipCode.NO_WRITABLE_TARGET and (
-                not self.ctx or not self.ctx.user
-            ):
-                continue
+            if resolution_skip.reason_code == MemoryOperationSkipCode.NO_WRITABLE_TARGET:
+                if not self.ctx or not self.ctx.user:
+                    continue
+                if not self._has_writable_message_target():
+                    continue
             issue = {
                 "memory_type": operation.memory_type,
                 "page_id": operation.page_id,
@@ -500,6 +536,21 @@ class ExtractLoop:
             }
             issues.append(issue)
         return issues
+
+    def _has_writable_message_target(self) -> bool:
+        """Preserve legacy retries if the isolation handler cannot answer the check."""
+        handler = self._isolation_handler
+        has_writable_target = getattr(handler, "has_writable_message_target", None)
+        if not callable(has_writable_target):
+            return True
+        try:
+            return bool(has_writable_target())
+        except Exception:
+            logger.warning(
+                "Unable to determine writable message targets; preserving resolution repair",
+                exc_info=True,
+            )
+            return True
 
     def _build_resolution_repair_instruction(self, issues: List[Dict[str, Any]]) -> str:
         return self._output_protocol.render_resolution_repair(issues)
@@ -865,11 +916,24 @@ class ExtractLoop:
                                 for field in schema.fields
                                 if field.merge_op == MergeOp.IMMUTABLE
                             }
-                            for field_name in immutable_fields:
-                                if ImmutableOp.is_set(old_content.extra_fields.get(field_name)):
-                                    resolved_op.memory_fields[field_name] = (
-                                        old_content.extra_fields[field_name]
-                                    )
+                            preserved_fields = set(immutable_fields)
+                            preserved_fields.update(schema.identity_fields(include_peer_id=False))
+                            for field_name in preserved_fields:
+                                old_value = old_content.extra_fields.get(field_name)
+                                if not ImmutableOp.is_set(old_value):
+                                    continue
+                                new_value = resolved_op.memory_fields.get(field_name)
+                                if field_name in immutable_fields or not ImmutableOp.is_set(
+                                    new_value
+                                ):
+                                    resolved_op.memory_fields[field_name] = old_value
+                            target_uri = await self._updated_uri_for_existing_operation(
+                                resolved_op,
+                                schema=schema,
+                                source_uri=resolved_uri,
+                            )
+                            if target_uri != resolved_uri:
+                                resolved_op.uris = [target_uri]
                     else:
                         resolved_op.uris = self._isolation_handler.calculate_memory_uris(
                             memory_type_schema=schema,
@@ -885,8 +949,8 @@ class ExtractLoop:
 
                 upsert_operations.append(resolved_op)
 
-        delete_ids = self._normalize_delete_ids(getattr(operations, "delete_ids", []) or [])
         delete_replacements: dict[str, str] = {}
+        delete_ids = self._normalize_delete_ids(getattr(operations, "delete_ids", []) or [])
         for delete_id in delete_ids:
             if delete_id.delete_page_id is None or page_id_map is None:
                 continue
@@ -920,14 +984,19 @@ class ExtractLoop:
                         delete_id.replacement_page_id,
                     )
                     continue
-                replacement_uri = page_id_map.resolve(replacement_page_id)
+                replacement_uri = next(
+                    (
+                        op.uris[0]
+                        for op in upsert_operations
+                        if op.page_id == replacement_page_id and op.uris
+                    ),
+                    None,
+                )
                 if not replacement_uri:
-                    for op in upsert_operations:
-                        if op.page_id == replacement_page_id and op.uris:
-                            replacement_uri = op.uris[0]
-                            break
+                    replacement_uri = page_id_map.resolve(replacement_page_id)
 
-            delete_file_contents.append(old_content)
+            if all(file.uri != old_content.uri for file in delete_file_contents):
+                delete_file_contents.append(old_content)
             if replacement_uri and replacement_uri != delete_uri:
                 delete_replacements[delete_uri] = replacement_uri
 
@@ -959,6 +1028,56 @@ class ExtractLoop:
                     break
 
         return resolved, raw_links
+
+    async def _updated_uri_for_existing_operation(
+        self,
+        operation: ResolvedOperation,
+        *,
+        schema: Any,
+        source_uri: str,
+    ) -> str:
+        """Recompute an existing object's URI after mutable identity-field updates."""
+        old_content = operation.old_memory_file_content
+        if old_content is None:
+            return source_uri
+
+        uri_fields = dict(old_content.extra_fields or {})
+        schema_fields = {field.name: field for field in schema.fields}
+        identity_field_changed = False
+        for field_name in schema.identity_fields(include_peer_id=False):
+            field = schema_fields.get(field_name)
+            if field is None or field_name not in operation.memory_fields:
+                continue
+            current_value = (
+                old_content.plain_content()
+                if field_name == "content"
+                else old_content.extra_fields.get(field_name)
+            )
+            try:
+                new_value = await MergeOpFactory.from_field(field).apply(
+                    current_value,
+                    operation.memory_fields[field_name],
+                )
+            except Exception:
+                new_value = current_value
+            if new_value != current_value:
+                identity_field_changed = True
+            uri_fields[field_name] = new_value
+        if not identity_field_changed:
+            return source_uri
+
+        prefix = "viking://user/"
+        namespace, separator, _ = source_uri.partition("/memories/")
+        if not separator or not namespace.startswith(prefix):
+            return source_uri
+        user_space = namespace.removeprefix(prefix)
+        candidate_uri = generate_uri(
+            memory_type=schema,
+            fields=uri_fields,
+            user_space=user_space,
+            extract_context=self._extract_context,
+        )
+        return candidate_uri if candidate_uri != source_uri else source_uri
 
     def _normalize_delete_ids(self, raw_delete_ids: List[Any]) -> List[DeleteId]:
         delete_ids: List[DeleteId] = []
@@ -1026,7 +1145,7 @@ class ExtractLoop:
                 if page_id is None:
                     continue
                 uri = page_id_map.resolve(page_id)
-                if uri:
+                if uri and page_id not in op_page_map:
                     page_uri_map.setdefault(page_id, [])
                     if uri not in page_uri_map[page_id]:
                         page_uri_map[page_id].insert(0, uri)
@@ -1102,8 +1221,11 @@ class ExtractLoop:
         Returns:
             Tuple of (tool_calls, operations) - one will be None, the other set
         """
-        # Call LLM with tools - use tools from strategy
-        tools = None
+        # Call LLM with tools - use tools from strategy. Pass tools=[] (not None)
+        # when tools are disabled so backends following the OpenAI backend's
+        # `tools is not None` convention still return a VLMResponse carrying
+        # finish_reason and usage instead of a bare string.
+        tools: Optional[List[Dict[str, Any]]] = []
         tool_choice = None
         if not self._disable_tools_for_iteration and self._tool_schemas:
             tools = self._tool_schemas
@@ -1148,6 +1270,21 @@ class ExtractLoop:
                     f"[KVCache] prompt_tokens={prompt_tokens}, cached_tokens={cached_tokens}"
                 )
 
+        # Reject explicit truncation before handling tool calls or parsing:
+        # neither a partial tool call nor a parseable program is safe to use.
+        # run() treats budget_exhausted as terminal, without a format retry.
+        if getattr(response, "finish_reason", None) == "length":
+            content = getattr(response, "content", None) or ""
+            self._last_llm_failure_kind = "budget_exhausted"
+            self._last_llm_failure_content = content
+            self._last_parse_error = self._budget_exhausted_error(response, content)
+            tracer.set("memory.extraction.parse_error", self._last_parse_error)
+            logger.debug(
+                "Response truncated by output-token budget "
+                f"failure_kind=budget_exhausted error={self._last_parse_error}"
+            )
+            return (None, None)
+
         # Case 0: Handle string response (when tools are not provided) or None
         if response is None:
             content = ""
@@ -1164,6 +1301,9 @@ class ExtractLoop:
         else:
             # Case 2: VLMResponse without tool calls - get content from response
             content = response.content or ""
+
+        # No tool calls (Case 0 & 2): strip reasoning tags in the text before parsing.
+        content = VLMBase._clean_response(content)
 
         # Parse operations from content
         if content:
@@ -1254,13 +1394,21 @@ class ExtractLoop:
         )
         from openviking.session.memory.merge_op.patch_handler import unescape_markers
 
+        def field_value(memory_file: MemoryFile, field_name: str) -> str:
+            value = (
+                memory_file.plain_content()
+                if field_name == "content"
+                else memory_file.extra_fields.get(field_name)
+            )
+            # Other memory types can use the same field name for non-string data.
+            return value if isinstance(value, str) else ""
+
         errors = []
         patch_op = PatchOp(FieldType.STRING)
         read_files = self.context_provider.read_file_contents or {}
         for operation in operations.upsert_operations:
             if operation.old_memory_file_content is None:
                 continue
-            current_content = operation.old_memory_file_content.plain_content() or ""
             target_uri = (
                 operation.uris[0] if operation.uris else operation.old_memory_file_content.uri
             )
@@ -1276,7 +1424,7 @@ class ExtractLoop:
                             blocks.extend(StrPatch.model_validate({"blocks": [raw_block]}).blocks)
                 if not blocks:
                     continue
-                working_content = current_content
+                working_content = field_value(operation.old_memory_file_content, field_name)
                 for block_index, block in enumerate(blocks, start=1):
                     search = block.search or ""
                     if not search or search == block.replace:
@@ -1306,7 +1454,7 @@ class ExtractLoop:
                     found_in = [
                         uri
                         for uri, memory_file in read_files.items()
-                        if uri != target_uri and search in (memory_file.plain_content() or "")
+                        if uri != target_uri and search in field_value(memory_file, field_name)
                     ]
                     errors.append(
                         {

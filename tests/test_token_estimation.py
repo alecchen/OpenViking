@@ -4,7 +4,7 @@
 """Shared token estimation tests."""
 
 from openviking.message import Message, TextPart
-from openviking.session import Session
+from openviking.session.archive_store import ArchiveStore
 from openviking.utils.token_estimation import (
     estimate_text_tokens,
     truncate_text_to_token_budget,
@@ -36,11 +36,10 @@ async def test_archive_overview_tokens_do_not_trust_stale_low_metadata():
             del uri, ctx
             return '{"overview_tokens": 1}'
 
-    fake_session = type("FakeSession", (), {"_viking_fs": FakeFS(), "ctx": None})()
+    store = ArchiveStore(FakeFS(), None, "viking://user/default/sessions/test")
 
-    tokens = await Session._read_archive_overview_tokens(
-        fake_session,
-        "viking://session/test/history/archive_001",
+    tokens = await store.read_overview_tokens(
+        "viking://user/default/sessions/test/history/archive_001",
         "\u4f60\u597d\u4e16\u754c",
     )
 
@@ -53,11 +52,10 @@ async def test_archive_overview_tokens_keep_higher_metadata_estimate():
             del uri, ctx
             return '{"overview_tokens": 5}'
 
-    fake_session = type("FakeSession", (), {"_viking_fs": FakeFS(), "ctx": None})()
+    store = ArchiveStore(FakeFS(), None, "viking://user/default/sessions/test")
 
-    tokens = await Session._read_archive_overview_tokens(
-        fake_session,
-        "viking://session/test/history/archive_001",
+    tokens = await store.read_overview_tokens(
+        "viking://user/default/sessions/test/history/archive_001",
         "abcd",
     )
 
